@@ -1,0 +1,80 @@
+name: CI/CD to Hugging Face Space with uv
+
+on:
+  push:
+    branches:
+      - main # Or your default branch, e.g., 'master', 'dev'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for HF_TOKEN availability
+        id: check_hf_token
+        env:
+          HF_TOKEN_CHECK: ${{ secrets.HF_TOKEN }} # Pass the secret to an env var for shell check
+        run: |
+          if [ -z "$HF_TOKEN_CHECK" ]; then
+            echo "::notice::HF_TOKEN secret is not set. Hugging Face Space push will be skipped."
+            echo "push_enabled=false" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::HF_TOKEN secret is set. Proceeding with Hugging Face Space push."
+            echo "push_enabled=true" >> $GITHUB_OUTPUT
+          fi
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12" # Recommended: specify a precise version like '3.10', '3.11', or '3.12'
+
+      - name: Install uv
+        # Installs the uv tool on the GitHub Actions runner
+        uses: astral-sh/setup-uv@v1
+
+      - name: Check for pyproject.toml existence
+        id: check_pyproject
+        run: |
+          if [ -f pyproject.toml ]; then
+            echo "::notice::pyproject.toml found. Proceeding with uv pip compile."
+            echo "pyproject_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::pyproject.toml not found. Skipping requirements.txt generation via uv pip compile."
+            echo "pyproject_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate requirements.txt using uv
+        id: generate_reqs
+        # This step will only run if pyproject.toml was found in the previous step
+        if: ${{ steps.check_pyproject.outputs.pyproject_exists == 'true' }}
+        run: |
+          # Use uv pip compile to generate a locked requirements.txt from pyproject.toml
+          # This ensures reproducibility.
+          uv export --no-hashes --format requirements-txt > requirements.txt
+          # uv pip compile pyproject.toml -o requirements.txt
+
+          # Check if requirements.txt was created
+          if [ -f requirements.txt ]; then
+            echo "requirements.txt generated successfully:"
+            cat requirements.txt
+          else
+            echo "Error: requirements.txt was not generated despite pyproject.toml existing."
+            exit 1
+          fi
+
+      # - name: Get ready to push to HuggingFace Space
+      #   # This step will only run if 'push_enabled' output from the previous step is 'true'
+      #   if: ${{ steps.check_hf_token.outputs.push_enabled == 'true' }}
+      #   uses: actions/checkout@v3
+      #   with:
+      #     fetch-depth: 0
+      #     lfs: true
+      - name: Push to HuggingFace Space
+        if: ${{ steps.check_hf_token.outputs.push_enabled == 'true' }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: git push https://HF_USERNAME:$HF_TOKEN@huggingface.co/spaces/HF_USERNAME/SPACE_NAME main
