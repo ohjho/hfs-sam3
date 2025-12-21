@@ -1,5 +1,5 @@
+import sys
 import tempfile
-import time
 
 import cv2
 import gradio as gr
