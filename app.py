@@ -7,6 +7,7 @@ import matplotlib
 import numpy as np
 import spaces
 import torch
+from loguru import logger
 from PIL import Image
 from transformers import (
     Sam3VideoModel,
