@@ -13,12 +13,15 @@ short_description: short description for your Space App
 # SAM3 HuggingFace Space Demo
 with inspiration from [prithivMLmods' demo](https://huggingface.co/spaces/prithivMLmods/SAM3-Demo), using the [transformers API](https://huggingface.co/docs/transformers/main/en/model_doc/sam3_video)
 
+# Requirements
+using `git+https://github.com/huggingface/transformers.git` for now since it's not yet available on the latest release of transformers (v4.57.3 at the time of writing)
+
 # The HuggingFace Space Template
 setup with [github action to update automatically update your space](https://huggingface.co/docs/hub/spaces-github-actions)
 and manage dependencies with `uv`
 
 You will need to update [`deploy_to_hf_space.yaml`](.github/workflows/deploy_to_hf_space.yaml) with the details for your space and
-setup your `HF_TOKEN` in your [Github secret](https://docs.github.com/en/actions/security-guides/encrypted-secrets#creating-encrypted-secrets-for-an-environment)
+setup your `HF_TOKEN` and `FORCE_PUSH` in your [Github secret](https://docs.github.com/en/actions/security-guides/encrypted-secrets#creating-encrypted-secrets-for-an-environment)
 
 > [!WARNING]
 > The Githuh Action *Force* push changes to HuggingFace Space

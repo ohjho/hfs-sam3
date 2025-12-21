@@ -88,6 +88,6 @@ jobs:
             echo "::notice::FORCE_PUSH secret is not set."
             git push https://GF-John:$HF_TOKEN@huggingface.co/spaces/GF-John/sam3 main
           else
-            echo "::notice::FORCE_PUSH secret is set. Doing Force Push toHugging Face Space."
+            echo "::notice::FORCE_PUSH secret is set. Doing Force Push to Hugging Face Space."
             git push -f https://GF-John:$HF_TOKEN@huggingface.co/spaces/GF-John/sam3 main
           fi
