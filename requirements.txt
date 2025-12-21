@@ -1,0 +1,9 @@
+torch
+torchvision
+transformers
+accelerate
+loguru
+opencv-python-headless>=4.11.0.86
+peft
+sentencepiece
+matplotlib

@@ -10,6 +10,9 @@ pinned: false
 short_description: short description for your Space App
 ---
 
+# SAM3 HuggingFace Space Demo
+with inspiration from [prithivMLmods' demo](https://huggingface.co/spaces/prithivMLmods/SAM3-Demo), using the [transformers API](https://huggingface.co/docs/transformers/main/en/model_doc/sam3_video)
+
 # The HuggingFace Space Template
 setup with [github action to update automatically update your space](https://huggingface.co/docs/hub/spaces-github-actions)
 and manage dependencies with `uv`

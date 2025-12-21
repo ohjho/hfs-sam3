@@ -1,18 +1,22 @@
-import spaces, torch, time
+import tempfile
+import time
+
+import cv2
 import gradio as gr
+import matplotlib
+import numpy as np
+import spaces
+import torch
+from PIL import Image
 from transformers import (
-    AutoModelForImageTextToText,
-    AutoProcessor,
-    BitsAndBytesConfig,
+    Sam3VideoModel,
+    Sam3VideoProcessor,
 )
 
-# Flash Attention for ZeroGPU
-import subprocess
-
-subprocess.run(
-    "pip install flash-attn --no-build-isolation",
-    env={"FLASH_ATTENTION_SKIP_CUDA_BUILD": "TRUE"},
-    shell=True,
+logger.remove()
+logger.add(
+    sys.stderr,
+    format="<d>{time:YYYY-MM-DD ddd HH:mm:ss}</d> | <lvl>{level}</lvl> | <lvl>{message}</lvl>",
 )
 
 # Set target DEVICE and DTYPE
@@ -22,153 +26,166 @@ DTYPE = (
     else torch.float16
 )
 DEVICE = "auto"
-print(f"Device: {DEVICE}, dtype: {DTYPE}")
+logger.info(f"Device: {DEVICE}, dtype: {DTYPE}")
 
 
-def load_model(
-    model_name: str = "chancharikm/qwen2.5-vl-7b-cam-motion-preview",
-    use_flash_attention: bool = True,
-    apply_quantization: bool = True,
-):
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,  # Load model weights in 4-bit
-        bnb_4bit_quant_type="nf4",  # Use NF4 quantization (or "fp4")
-        bnb_4bit_compute_dtype=DTYPE,  # Perform computations in bfloat16/float16
-        bnb_4bit_use_double_quant=True,  # Optional: further quantization for slightly more memory saving
-    )
+def apply_mask_overlay(base_image, mask_data, object_ids=None, opacity=0.5):
+    """Draws segmentation masks on top of an image, using object IDs for coloring."""
+    if isinstance(base_image, np.ndarray):
+        base_image = Image.fromarray(base_image)
+    base_image = base_image.convert("RGBA")
 
-    # Determine model family from model name
-    model_family = model_name.split("/")[-1].split("-")[0]
+    if mask_data is None or len(mask_data) == 0:
+        return base_image.convert("RGB")
 
-    # Common model loading arguments
-    common_args = {
-        "torch_dtype": DTYPE,
-        "device_map": DEVICE,
-        "low_cpu_mem_usage": True,
-        "quantization_config": bnb_config if apply_quantization else None,
-    }
-    if use_flash_attention:
-        common_args["attn_implementation"] = "flash_attention_2"
+    if isinstance(mask_data, torch.Tensor):
+        mask_data = mask_data.cpu().numpy()
+    mask_data = mask_data.astype(np.uint8)
 
-    # Load model based on family
-    match model_family:
-        # case "qwen2.5" | "Qwen2.5":
-        #     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        #         model_name, **common_args
-        #     )
-        case "InternVL3":
-            model = AutoModelForImageTextToText.from_pretrained(
-                model_name, **common_args
+    # Handle dimensions
+    if mask_data.ndim == 4:
+        mask_data = mask_data[0]
+    if mask_data.ndim == 3 and mask_data.shape[0] == 1:
+        mask_data = mask_data[0]
+
+    num_masks = mask_data.shape[0] if mask_data.ndim == 3 else 1
+    if mask_data.ndim == 2:
+        mask_data = [mask_data]
+        num_masks = 1
+
+    # Use object_ids for coloring if provided, else fallback to index
+    if object_ids is not None and len(object_ids) == num_masks:
+        # Use a fixed color map and assign color based on object_id
+        try:
+            color_map = matplotlib.colormaps["rainbow"]
+        except AttributeError:
+            import matplotlib.cm as cm
+
+            color_map = cm.get_cmap("rainbow")
+        # Normalize object_ids to a color index (e.g., mod by 256)
+        unique_ids = sorted(set(object_ids))
+        id_to_color_idx = {oid: i for i, oid in enumerate(unique_ids)}
+        rgb_colors = [
+            tuple(
+                int(c * 255)
+                for c in color_map(id_to_color_idx[oid] / max(len(unique_ids), 1))[:3]
             )
-        case _:
-            raise ValueError(f"Unsupported model family: {model_family}")
+            for oid in object_ids
+        ]
+    else:
+        try:
+            color_map = matplotlib.colormaps["rainbow"].resampled(max(num_masks, 1))
+        except AttributeError:
+            import matplotlib.cm as cm
 
-    # Set model to evaluation mode for inference (disables dropout, etc.)
-    return model.eval()
+            color_map = cm.get_cmap("rainbow").resampled(max(num_masks, 1))
+        rgb_colors = [
+            tuple(int(c * 255) for c in color_map(i)[:3]) for i in range(num_masks)
+        ]
 
+    composite_layer = Image.new("RGBA", base_image.size, (0, 0, 0, 0))
 
-def load_processor(model_name="Qwen/Qwen2.5-VL-7B-Instruct"):
-    return AutoProcessor.from_pretrained(
-        model_name,
-        device_map=DEVICE,
-        use_fast=True,
-        torch_dtype=DTYPE,
-    )
+    for i, single_mask in enumerate(mask_data):
+        mask_bitmap = Image.fromarray((single_mask * 255).astype(np.uint8))
+        if mask_bitmap.size != base_image.size:
+            mask_bitmap = mask_bitmap.resize(base_image.size, resample=Image.NEAREST)
+
+        fill_color = rgb_colors[i]
+        color_fill = Image.new("RGBA", base_image.size, fill_color + (0,))
+        mask_alpha = mask_bitmap.point(lambda v: int(v * opacity) if v > 0 else 0)
+        color_fill.putalpha(mask_alpha)
+        composite_layer = Image.alpha_composite(composite_layer, color_fill)
+
+    return Image.alpha_composite(base_image, composite_layer).convert("RGB")
 
 
 print("Loading Models and Processors...")
-MODEL_ZOO = {
-    "qwen2.5-vl-7b-instruct": load_model(
-        model_name="Qwen/Qwen2.5-VL-7B-Instruct",
-        use_flash_attention=False,
-        apply_quantization=False,
-    ),
-    "InternVL3-1B-hf": load_model(
-        model_name="OpenGVLab/InternVL3-1B-hf",
-        use_flash_attention=False,
-        apply_quantization=False,
-    ),
-    "InternVL3-2B-hf": load_model(
-        model_name="OpenGVLab/InternVL3-2B-hf",
-        use_flash_attention=False,
-        apply_quantization=False,
-    ),
-    "InternVL3-8B-hf": load_model(
-        model_name="OpenGVLab/InternVL3-8B-hf",
-        use_flash_attention=False,
-        apply_quantization=True,
-    ),
-}
-
-PROCESSORS = {
-    "qwen2.5-vl-7b-instruct": load_processor("Qwen/Qwen2.5-VL-7B-Instruct"),
-    "InternVL3-1B-hf": load_processor("OpenGVLab/InternVL3-1B-hf"),
-    "InternVL3-2B-hf": load_processor("OpenGVLab/InternVL3-2B-hf"),
-    "InternVL3-8B-hf": load_processor("OpenGVLab/InternVL3-8B-hf"),
-}
-print("Models and Processors Loaded!")
+try:
+    VID_MODEL = Sam3VideoModel.from_pretrained("facebook/sam3").to(DEVICE, dtype=DTYPE)
+    VID_PROCESSOR = Sam3VideoProcessor.from_pretrained("facebook/sam3")
+    logger.success("Models and Processors Loaded!")
+except Exception as e:
+    logger.error(f"❌ CRITICAL ERROR LOADING VIDEO MODELS: {e}")
+    VID_MODEL = None
+    VID_PROCESSOR = None
 
 
 # Our Inference Function
 @spaces.GPU(duration=120)
-def video_inference(
-    video_path: str,
-    prompt: str,
-    model_name: str,
-    fps: int = 8,
-    max_tokens: int = 512,
-    temperature: float = 0.1,
-):
-    s_time = time.time()
-    model = MODEL_ZOO[model_name]
-    processor = PROCESSORS[model_name]
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "video",
-                    "video": video_path,
-                },
-                {"type": "text", "text": prompt},
-            ],
+def video_inference(input_video, prompt):
+    """
+    Segments objects in a video using a text prompt.
+    Returns a JSON with output video path and status.
+    """
+    if VID_MODEL is None or VID_PROCESSOR is None:
+        return {
+            "output_video": None,
+            "status": "Video Models failed to load on startup.",
         }
-    ]
-    with torch.no_grad():
-        model_family = model_name.split("-")[0]
-        match model_family:
-            case "InternVL3":
-                inputs = processor.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    return_dict=True,
-                    return_tensors="pt",
-                    fps=fps,
-                    # num_frames = 8
-                ).to("cuda", dtype=DTYPE)
-
-                output = model.generate(
-                    **inputs,
-                    max_new_tokens=max_tokens,
-                    temperature=float(temperature),
-                    do_sample=temperature > 0.0,
+    if input_video is None or not prompt:
+        return {"output_video": None, "status": "Missing video or prompt."}
+    try:
+        # Gradio passes a dict with 'name' key for uploaded files
+        video_path = (
+            input_video
+            if isinstance(input_video, str)
+            else input_video.get("name", None)
+        )
+        if not video_path:
+            return {"output_video": None, "status": "Invalid video input."}
+        video_cap = cv2.VideoCapture(video_path)
+        vid_fps = video_cap.get(cv2.CAP_PROP_FPS)
+        vid_w = int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        vid_h = int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        video_frames = []
+        while video_cap.isOpened():
+            ret, frame = video_cap.read()
+            if not ret:
+                break
+            video_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        video_cap.release()
+        if len(video_frames) == 0:
+            return {"output_video": None, "status": "No frames found in video."}
+        session = VID_PROCESSOR.init_video_session(
+            video=video_frames, inference_device=DEVICE, dtype=DTYPE
+        )
+        session = VID_PROCESSOR.add_text_prompt(inference_session=session, text=prompt)
+        temp_out_path = tempfile.mktemp(suffix=".mp4")
+        video_writer = cv2.VideoWriter(
+            temp_out_path, cv2.VideoWriter_fourcc(*"mp4v"), vid_fps, (vid_w, vid_h)
+        )
+        for model_out in VID_MODEL.propagate_in_video_iterator(
+            inference_session=session, max_frame_num_to_track=len(video_frames)
+        ):
+            post_processed = VID_PROCESSOR.postprocess_outputs(session, model_out)
+            f_idx = model_out.frame_idx
+            original_pil = Image.fromarray(video_frames[f_idx])
+            if "masks" in post_processed:
+                detected_masks = post_processed["masks"]
+                object_ids = post_processed["object_ids"]
+                if detected_masks.ndim == 4:
+                    detected_masks = detected_masks.squeeze(1)
+                final_frame = apply_mask_overlay(
+                    original_pil, detected_masks, object_ids=object_ids
                 )
-                output_text = processor.decode(
-                    output[0, inputs["input_ids"].shape[1] :], skip_special_tokens=True
-                )
-            case _:
-                raise ValueError(f"{model_name} is not currently supported")
-    return {
-        "output_text": output_text,
-        "fps": fps,
-        "inference_time": time.time() - s_time,
-    }
+            else:
+                final_frame = original_pil
+            video_writer.write(cv2.cvtColor(np.array(final_frame), cv2.COLOR_RGB2BGR))
+        video_writer.release()
+        return {
+            "output_video": temp_out_path,
+            "status": "Video processing completed successfully.✅",
+        }
+    except Exception as e:
+        return {
+            "output_video": None,
+            "status": f"Error during video processing: {str(e)}",
+        }
 
 
 # the Gradio App
 app = gr.Interface(
-    fn=inference,
+    fn=video_inference,
     inputs=[
         gr.Video(label="Input Video"),
         gr.Textbox(
@@ -177,33 +194,10 @@ app = gr.Interface(
             info="Some models like [cam motion](https://huggingface.co/chancharikm/qwen2.5-vl-7b-cam-motion-preview) are trained specific prompts",
             value="Describe the camera motion in this video.",
         ),
-        gr.Dropdown(label="Model", choices=list(MODEL_ZOO.keys())),
-        gr.Number(
-            label="FPS",
-            info="inference sampling rate (Qwen2.5VL is trained on videos with 8 fps); a value of 0 means the FPS of the input video will be used",
-            value=8,
-            minimum=0,
-            step=1,
-        ),
-        gr.Slider(
-            label="Max Tokens",
-            info="maximum number of tokens to generate",
-            value=128,
-            minimum=32,
-            maximum=512,
-            step=32,
-        ),
-        gr.Slider(
-            label="Temperature",
-            value=0.0,
-            minimum=0.0,
-            maximum=1.0,
-            step=0.1,
-        ),
     ],
     outputs=gr.JSON(label="Output JSON"),
-    title="Video Chat with VLM",
-    description='comparing various "small" VLMs on the task of video captioning',
+    title="SAM3 Video Segmentation",
+    description="Segment Objects in Video using Text Prompts",
     api_name="video_inference",
 )
 app.launch(
