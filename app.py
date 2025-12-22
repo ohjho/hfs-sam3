@@ -31,7 +31,7 @@ DTYPE = (
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     else torch.float16
 )
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Device: {DEVICE}, dtype: {DTYPE}")
 logger.info("Loading Models and Processors...")
 try:
@@ -187,6 +187,7 @@ def video_inference(input_video, prompt: str):
                     detected_masks = detected_masks.squeeze(1)
                 # detected_masks: (num_objects, H, W)
                 for i, mask in enumerate(detected_masks):
+                    mask = mask.cpu().numpy()
                     mask_bin = (mask > 0.0).astype(np.uint8)
                     xyxy = mask_to_xyxy(mask_bin)
                     if not xyxy:
