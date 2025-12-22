@@ -180,6 +180,7 @@ def video_inference(input_video, prompt: str):
         if "masks" in post_processed:
             detected_masks = post_processed["masks"]
             object_ids = post_processed["object_ids"]
+            object_ids = [int(oid) for oid in object_ids]
             if detected_masks.ndim == 4:
                 detected_masks = detected_masks.squeeze(1)
             # detected_masks: (num_objects, H, W)
@@ -192,7 +193,7 @@ def video_inference(input_video, prompt: str):
                 x0, y0, x1, y1 = xyxy
                 det = {
                     "frame": f_idx,
-                    "track_id": int(object_ids[i]) if object_ids is not None else i,
+                    "track_id": int(object_ids[i]),
                     "x": x0 / vid_w,
                     "y": y0 / vid_h,
                     "w": (x1 - x0) / vid_w,
