@@ -31,8 +31,17 @@ DTYPE = (
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     else torch.float16
 )
-DEVICE = "auto"
+DEVICE = "cuda"
 logger.info(f"Device: {DEVICE}, dtype: {DTYPE}")
+logger.info("Loading Models and Processors...")
+try:
+    VID_MODEL = Sam3VideoModel.from_pretrained("facebook/sam3").to(DEVICE, dtype=DTYPE)
+    VID_PROCESSOR = Sam3VideoProcessor.from_pretrained("facebook/sam3")
+    logger.success("Models and Processors Loaded!")
+except Exception as e:
+    logger.error(f"❌ CRITICAL ERROR LOADING VIDEO MODELS: {e}")
+    VID_MODEL = None
+    VID_PROCESSOR = None
 
 
 def apply_mask_overlay(base_image, mask_data, object_ids=None, opacity=0.5):
@@ -103,17 +112,6 @@ def apply_mask_overlay(base_image, mask_data, object_ids=None, opacity=0.5):
         composite_layer = Image.alpha_composite(composite_layer, color_fill)
 
     return Image.alpha_composite(base_image, composite_layer).convert("RGB")
-
-
-logger.info("Loading Models and Processors...")
-try:
-    VID_MODEL = Sam3VideoModel.from_pretrained("facebook/sam3").to(DEVICE, dtype=DTYPE)
-    VID_PROCESSOR = Sam3VideoProcessor.from_pretrained("facebook/sam3")
-    logger.success("Models and Processors Loaded!")
-except Exception as e:
-    logger.error(f"❌ CRITICAL ERROR LOADING VIDEO MODELS: {e}")
-    VID_MODEL = None
-    VID_PROCESSOR = None
 
 
 # Our Inference Function
