@@ -1,3 +1,4 @@
+# Import helpers for mask encoding and bbox extraction
 import sys
 import tempfile
 
@@ -13,6 +14,10 @@ from transformers import (
     Sam3VideoModel,
     Sam3VideoProcessor,
 )
+
+# import local helpers
+from toolbox.mask_encoding import b64_mask_encode
+from visualizer import mask_to_xyxy
 
 logger.remove()
 logger.add(
@@ -100,7 +105,7 @@ def apply_mask_overlay(base_image, mask_data, object_ids=None, opacity=0.5):
     return Image.alpha_composite(base_image, composite_layer).convert("RGB")
 
 
-print("Loading Models and Processors...")
+logger.info("Loading Models and Processors...")
 try:
     VID_MODEL = Sam3VideoModel.from_pretrained("facebook/sam3").to(DEVICE, dtype=DTYPE)
     VID_PROCESSOR = Sam3VideoProcessor.from_pretrained("facebook/sam3")
@@ -113,18 +118,23 @@ except Exception as e:
 
 # Our Inference Function
 @spaces.GPU(duration=120)
-def video_inference(input_video, prompt):
+def video_inference(input_video, prompt: str):
     """
     Segments objects in a video using a text prompt.
-    Returns a JSON with output video path and status.
+    Returns a list of detection dicts (one per object per frame) and output video path/status.
     """
     if VID_MODEL is None or VID_PROCESSOR is None:
         return {
             "output_video": None,
+            "detections": [],
             "status": "Video Models failed to load on startup.",
         }
     if input_video is None or not prompt:
-        return {"output_video": None, "status": "Missing video or prompt."}
+        return {
+            "output_video": None,
+            "detections": [],
+            "status": "Missing video or prompt.",
+        }
     try:
         # Gradio passes a dict with 'name' key for uploaded files
         video_path = (
@@ -133,7 +143,11 @@ def video_inference(input_video, prompt):
             else input_video.get("name", None)
         )
         if not video_path:
-            return {"output_video": None, "status": "Invalid video input."}
+            return {
+                "output_video": None,
+                "detections": [],
+                "status": "Invalid video input.",
+            }
         video_cap = cv2.VideoCapture(video_path)
         vid_fps = video_cap.get(cv2.CAP_PROP_FPS)
         vid_w = int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -146,7 +160,11 @@ def video_inference(input_video, prompt):
             video_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         video_cap.release()
         if len(video_frames) == 0:
-            return {"output_video": None, "status": "No frames found in video."}
+            return {
+                "output_video": None,
+                "detections": [],
+                "status": "No frames found in video.",
+            }
         session = VID_PROCESSOR.init_video_session(
             video=video_frames, inference_device=DEVICE, dtype=DTYPE
         )
@@ -155,17 +173,38 @@ def video_inference(input_video, prompt):
         video_writer = cv2.VideoWriter(
             temp_out_path, cv2.VideoWriter_fourcc(*"mp4v"), vid_fps, (vid_w, vid_h)
         )
+
+        detections = []
         for model_out in VID_MODEL.propagate_in_video_iterator(
             inference_session=session, max_frame_num_to_track=len(video_frames)
         ):
             post_processed = VID_PROCESSOR.postprocess_outputs(session, model_out)
             f_idx = model_out.frame_idx
             original_pil = Image.fromarray(video_frames[f_idx])
+            frame_detections = []
             if "masks" in post_processed:
                 detected_masks = post_processed["masks"]
                 object_ids = post_processed["object_ids"]
                 if detected_masks.ndim == 4:
                     detected_masks = detected_masks.squeeze(1)
+                # detected_masks: (num_objects, H, W)
+                for i, mask in enumerate(detected_masks):
+                    mask_bin = (mask > 0.0).astype(np.uint8)
+                    xyxy = mask_to_xyxy(mask_bin)
+                    if not xyxy:
+                        continue
+                    x0, y0, x1, y1 = xyxy
+                    det = {
+                        "frame": f_idx,
+                        "track_id": int(object_ids[i]) if object_ids is not None else i,
+                        "x": x0 / vid_w,
+                        "y": y0 / vid_h,
+                        "w": (x1 - x0) / vid_w,
+                        "h": (y1 - y0) / vid_h,
+                        "conf": 1,
+                        "mask_b64": b64_mask_encode(mask_bin).decode("ascii"),
+                    }
+                    detections.append(det)
                 final_frame = apply_mask_overlay(
                     original_pil, detected_masks, object_ids=object_ids
                 )
@@ -175,11 +214,13 @@ def video_inference(input_video, prompt):
         video_writer.release()
         return {
             "output_video": temp_out_path,
+            "detections": detections,
             "status": "Video processing completed successfully.✅",
         }
     except Exception as e:
         return {
             "output_video": None,
+            "detections": [],
             "status": f"Error during video processing: {str(e)}",
         }
 
@@ -192,8 +233,8 @@ app = gr.Interface(
         gr.Textbox(
             label="Prompt",
             lines=3,
-            info="Some models like [cam motion](https://huggingface.co/chancharikm/qwen2.5-vl-7b-cam-motion-preview) are trained specific prompts",
-            value="Describe the camera motion in this video.",
+            info="Describe the Object(s) you would like to track/ segmentate",
+            value="",
         ),
     ],
     outputs=gr.JSON(label="Output JSON"),
