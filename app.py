@@ -133,95 +133,92 @@ def video_inference(input_video, prompt: str):
             "detections": [],
             "status": "Missing video or prompt.",
         }
-    try:
-        # Gradio passes a dict with 'name' key for uploaded files
-        video_path = (
-            input_video
-            if isinstance(input_video, str)
-            else input_video.get("name", None)
-        )
-        if not video_path:
-            return {
-                "output_video": None,
-                "detections": [],
-                "status": "Invalid video input.",
-            }
-        video_cap = cv2.VideoCapture(video_path)
-        vid_fps = video_cap.get(cv2.CAP_PROP_FPS)
-        vid_w = int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        vid_h = int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        video_frames = []
-        while video_cap.isOpened():
-            ret, frame = video_cap.read()
-            if not ret:
-                break
-            video_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        video_cap.release()
-        if len(video_frames) == 0:
-            return {
-                "output_video": None,
-                "detections": [],
-                "status": "No frames found in video.",
-            }
-        session = VID_PROCESSOR.init_video_session(
-            video=video_frames, inference_device=DEVICE, dtype=DTYPE
-        )
-        session = VID_PROCESSOR.add_text_prompt(inference_session=session, text=prompt)
-        temp_out_path = tempfile.mktemp(suffix=".mp4")
-        video_writer = cv2.VideoWriter(
-            temp_out_path, cv2.VideoWriter_fourcc(*"mp4v"), vid_fps, (vid_w, vid_h)
-        )
-
-        detections = []
-        for model_out in VID_MODEL.propagate_in_video_iterator(
-            inference_session=session, max_frame_num_to_track=len(video_frames)
-        ):
-            post_processed = VID_PROCESSOR.postprocess_outputs(session, model_out)
-            f_idx = model_out.frame_idx
-            original_pil = Image.fromarray(video_frames[f_idx])
-            frame_detections = []
-            if "masks" in post_processed:
-                detected_masks = post_processed["masks"]
-                object_ids = post_processed["object_ids"]
-                if detected_masks.ndim == 4:
-                    detected_masks = detected_masks.squeeze(1)
-                # detected_masks: (num_objects, H, W)
-                for i, mask in enumerate(detected_masks):
-                    mask = mask.cpu().numpy()
-                    mask_bin = (mask > 0.0).astype(np.uint8)
-                    xyxy = mask_to_xyxy(mask_bin)
-                    if not xyxy:
-                        continue
-                    x0, y0, x1, y1 = xyxy
-                    det = {
-                        "frame": f_idx,
-                        "track_id": int(object_ids[i]) if object_ids is not None else i,
-                        "x": x0 / vid_w,
-                        "y": y0 / vid_h,
-                        "w": (x1 - x0) / vid_w,
-                        "h": (y1 - y0) / vid_h,
-                        "conf": 1,
-                        "mask_b64": b64_mask_encode(mask_bin).decode("ascii"),
-                    }
-                    detections.append(det)
-                final_frame = apply_mask_overlay(
-                    original_pil, detected_masks, object_ids=object_ids
-                )
-            else:
-                final_frame = original_pil
-            video_writer.write(cv2.cvtColor(np.array(final_frame), cv2.COLOR_RGB2BGR))
-        video_writer.release()
-        return {
-            "output_video": temp_out_path,
-            "detections": detections,
-            "status": "Video processing completed successfully.✅",
-        }
-    except Exception as e:
+    # try:
+    # Gradio passes a dict with 'name' key for uploaded files
+    video_path = (
+        input_video if isinstance(input_video, str) else input_video.get("name", None)
+    )
+    if not video_path:
         return {
             "output_video": None,
             "detections": [],
-            "status": f"Error during video processing: {str(e)}",
+            "status": "Invalid video input.",
         }
+    video_cap = cv2.VideoCapture(video_path)
+    vid_fps = video_cap.get(cv2.CAP_PROP_FPS)
+    vid_w = int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    vid_h = int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    video_frames = []
+    while video_cap.isOpened():
+        ret, frame = video_cap.read()
+        if not ret:
+            break
+        video_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    video_cap.release()
+    if len(video_frames) == 0:
+        return {
+            "output_video": None,
+            "detections": [],
+            "status": "No frames found in video.",
+        }
+    session = VID_PROCESSOR.init_video_session(
+        video=video_frames, inference_device=DEVICE, dtype=DTYPE
+    )
+    session = VID_PROCESSOR.add_text_prompt(inference_session=session, text=prompt)
+    temp_out_path = tempfile.mktemp(suffix=".mp4")
+    video_writer = cv2.VideoWriter(
+        temp_out_path, cv2.VideoWriter_fourcc(*"mp4v"), vid_fps, (vid_w, vid_h)
+    )
+
+    detections = []
+    for model_out in VID_MODEL.propagate_in_video_iterator(
+        inference_session=session, max_frame_num_to_track=len(video_frames)
+    ):
+        post_processed = VID_PROCESSOR.postprocess_outputs(session, model_out)
+        f_idx = model_out.frame_idx
+        original_pil = Image.fromarray(video_frames[f_idx])
+        if "masks" in post_processed:
+            detected_masks = post_processed["masks"]
+            object_ids = post_processed["object_ids"]
+            if detected_masks.ndim == 4:
+                detected_masks = detected_masks.squeeze(1)
+            # detected_masks: (num_objects, H, W)
+            for i, mask in enumerate(detected_masks):
+                mask = mask.cpu().numpy()
+                mask_bin = (mask > 0.0).astype(np.uint8)
+                xyxy = mask_to_xyxy(mask_bin)
+                if not xyxy:
+                    continue
+                x0, y0, x1, y1 = xyxy
+                det = {
+                    "frame": f_idx,
+                    "track_id": int(object_ids[i]) if object_ids is not None else i,
+                    "x": x0 / vid_w,
+                    "y": y0 / vid_h,
+                    "w": (x1 - x0) / vid_w,
+                    "h": (y1 - y0) / vid_h,
+                    "conf": 1,
+                    "mask_b64": b64_mask_encode(mask_bin).decode("ascii"),
+                }
+                detections.append(det)
+            final_frame = apply_mask_overlay(
+                original_pil, detected_masks, object_ids=object_ids
+            )
+        else:
+            final_frame = original_pil
+        video_writer.write(cv2.cvtColor(np.array(final_frame), cv2.COLOR_RGB2BGR))
+    video_writer.release()
+    return {
+        "output_video": temp_out_path,
+        "detections": detections,
+        "status": "Video processing completed successfully.✅",
+    }
+    # except Exception as e:
+    #     return {
+    #         "output_video": None,
+    #         "detections": [],
+    #         "status": f"Error during video processing: {str(e)}",
+    #     }
 
 
 # the Gradio App
