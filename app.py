@@ -15,6 +15,9 @@ from transformers import (
     Sam3VideoProcessor,
 )
 
+# Import ffmpeg_extractor helpers
+from ffmpeg_extractor import extract_frames, get_video_metadata
+
 # import local helpers
 from toolbox.mask_encoding import b64_mask_encode
 from visualizer import mask_to_xyxy
@@ -144,23 +147,36 @@ def video_inference(input_video, prompt: str):
             "detections": [],
             "status": "Invalid video input.",
         }
-    video_cap = cv2.VideoCapture(video_path)
-    vid_fps = video_cap.get(cv2.CAP_PROP_FPS)
-    vid_w = int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    vid_h = int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    video_frames = []
-    while video_cap.isOpened():
-        ret, frame = video_cap.read()
-        if not ret:
-            break
-        video_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    video_cap.release()
-    if len(video_frames) == 0:
+    # Use FFmpeg-based helpers for metadata and frame extraction
+    vmeta = get_video_metadata(video_path, bverbose=False)
+    if not vmeta:
+        return {
+            "output_video": None,
+            "detections": [],
+            "status": "Failed to extract video metadata.",
+        }
+    vid_fps = vmeta["fps"]
+    vid_w = vmeta["width"]
+    vid_h = vmeta["height"]
+
+    # Extract frames as PIL Images (no timestamp/frame_num overlays)
+    pil_frames = extract_frames(
+        video_path,
+        fps=int(vid_fps),
+        max_short_edge=min(vid_w, vid_h),
+        write_timestamp=False,
+        write_frame_num=False,
+        output_dir=None,
+    )
+    if len(pil_frames) == 0:
         return {
             "output_video": None,
             "detections": [],
             "status": "No frames found in video.",
         }
+    # Convert PIL Images to numpy arrays (RGB)
+    video_frames = [np.array(frame.convert("RGB")) for frame in pil_frames]
+
     session = VID_PROCESSOR.init_video_session(
         video=video_frames, inference_device=DEVICE, dtype=DTYPE
     )
