@@ -1,6 +1,7 @@
 # Import helpers for mask encoding and bbox extraction
 import sys
 import tempfile
+from ast import Return
 
 import cv2
 import gradio as gr
@@ -117,6 +118,18 @@ def apply_mask_overlay(base_image, mask_data, object_ids=None, opacity=0.5):
     return Image.alpha_composite(base_image, composite_layer).convert("RGB")
 
 
+def frames_to_vid(pil_frames, output_path: str, vid_fps: int, vid_w: int, vid_h: int):
+    assert len(pil_frames) > 0, f"Number of frames must be greater than 0"
+    assert isinstance(pil_frames, list), f"pil_frames must be a list"
+    video_writer = cv2.VideoWriter(
+        output_path, cv2.VideoWriter_fourcc(*"mp4v"), vid_fps, (vid_w, vid_h)
+    )
+    for f in pil_frames:
+        video_writer.write(cv2.cvtColor(np.array(f), cv2.COLOR_RGB2BGR))
+    video_writer.release()
+    return output_path
+
+
 # Our Inference Function
 @spaces.GPU(duration=120)
 def video_inference(input_video, prompt: str):
@@ -182,11 +195,12 @@ def video_inference(input_video, prompt: str):
     )
     session = VID_PROCESSOR.add_text_prompt(inference_session=session, text=prompt)
     temp_out_path = tempfile.mktemp(suffix=".mp4")
-    video_writer = cv2.VideoWriter(
-        temp_out_path, cv2.VideoWriter_fourcc(*"mp4v"), vid_fps, (vid_w, vid_h)
-    )
+    # video_writer = cv2.VideoWriter(
+    #     temp_out_path, cv2.VideoWriter_fourcc(*"mp4v"), vid_fps, (vid_w, vid_h)
+    # )
 
     detections = []
+    annotated_frames = []
     for model_out in VID_MODEL.propagate_in_video_iterator(
         inference_session=session, max_frame_num_to_track=len(video_frames)
     ):
@@ -223,10 +237,18 @@ def video_inference(input_video, prompt: str):
             )
         else:
             final_frame = original_pil
-        video_writer.write(cv2.cvtColor(np.array(final_frame), cv2.COLOR_RGB2BGR))
-    video_writer.release()
+        # video_writer.write(cv2.cvtColor(np.array(final_frame), cv2.COLOR_RGB2BGR))
+        annotated_frames.append(final_frame)
+
+    # video_writer.release()
     return {
-        "output_video": temp_out_path,
+        "output_video": frames_to_vid(
+            annotated_frames,
+            output_path=temp_out_path,
+            vid_fps=vid_fps,
+            vid_h=vid_h,
+            vid_w=vid_w,
+        ),
         "detections": detections,
         "status": "Video processing completed successfully.✅",
     }
