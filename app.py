@@ -228,8 +228,8 @@ def video_inference(input_video, prompt: str, annotation_mode: bool = False):
     )
 
 
-# def video_annotation(input_video, prompt: str):
-#     return video_inference(input_video, prompt, annotation_mode=True)
+def video_annotation(input_video, prompt: str):
+    return video_inference(input_video, prompt, annotation_mode=True)
 
 
 # the Gradio App
@@ -253,7 +253,7 @@ with gr.Blocks() as app:
         )
     with gr.Tab("Video Annotation"):
         gr.Interface(
-            fn=video_inference,
+            fn=video_annotation,
             inputs=[
                 gr.Video(label="Input Video"),
                 gr.Textbox(
@@ -262,7 +262,6 @@ with gr.Blocks() as app:
                     info="Describe the Object(s) you would like to track/ segmentate",
                     value="",
                 ),
-                True,
             ],
             outputs=gr.Video(label="Processed Video"),
             title="SAM3 Video Segmentation",
