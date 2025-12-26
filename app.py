@@ -132,7 +132,7 @@ def frames_to_vid(pil_frames, output_path: str, vid_fps: int, vid_w: int, vid_h:
 
 # Our Inference Function
 @spaces.GPU(duration=120)
-def video_inference(input_video, prompt: str):
+def video_inference(input_video, prompt: str, annotation_mode: bool = False):
     """
     Segments objects in a video using a text prompt.
     Returns a list of detection dicts (one per object per frame) and output video path/status.
@@ -215,36 +215,60 @@ def video_inference(input_video, prompt: str):
             final_frame = original_pil
         annotated_frames.append(final_frame)
 
-    return {
-        "output_video": frames_to_vid(
+    return (
+        detections
+        if annotation_mode
+        else frames_to_vid(
             annotated_frames,
             output_path=temp_out_path,
             vid_fps=vid_fps,
             vid_h=vid_h,
             vid_w=vid_w,
-        ),
-        "detections": detections,
-        "status": "Video processing completed successfully.✅",
-    }
+        )
+    )
+
+
+# def video_annotation(input_video, prompt: str):
+#     return video_inference(input_video, prompt, annotation_mode=True)
 
 
 # the Gradio App
-app = gr.Interface(
-    fn=video_inference,
-    inputs=[
-        gr.Video(label="Input Video"),
-        gr.Textbox(
-            label="Prompt",
-            lines=3,
-            info="Describe the Object(s) you would like to track/ segmentate",
-            value="",
-        ),
-    ],
-    outputs=gr.JSON(label="Output JSON"),
-    title="SAM3 Video Segmentation",
-    description="Segment Objects in Video using Text Prompts",
-    api_name="video_inference",
-)
+with gr.Blocks() as app:
+    with gr.Tab("Video-Object Tracking"):
+        gr.Interface(
+            fn=video_inference,
+            inputs=[
+                gr.Video(label="Input Video"),
+                gr.Textbox(
+                    label="Prompt",
+                    lines=3,
+                    info="Describe the Object(s) you would like to track/ segmentate",
+                    value="",
+                ),
+            ],
+            outputs=gr.JSON(label="Output JSON"),
+            title="SAM3 Video Segmentation",
+            description="Segment Objects in Video using Text Prompts",
+            api_name="video_inference",
+        )
+    with gr.Tab("Video Annotation"):
+        gr.Interface(
+            fn=video_inference,
+            inputs=[
+                gr.Video(label="Input Video"),
+                gr.Textbox(
+                    label="Prompt",
+                    lines=3,
+                    info="Describe the Object(s) you would like to track/ segmentate",
+                    value="",
+                ),
+                True,
+            ],
+            outputs=gr.Video(label="Processed Video"),
+            title="SAM3 Video Segmentation",
+            description="Segment Objects in Video using Text Prompts",
+            api_name="video_annotation",
+        )
 app.launch(
     mcp_server=True, app_kwargs={"docs_url": "/docs"}  # add FastAPI Swagger API Docs
 )
