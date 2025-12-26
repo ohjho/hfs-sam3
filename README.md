@@ -1,5 +1,5 @@
 ---
-title: Name for you Space App
+title: SAM3
 emoji: 📚
 colorFrom: blue
 colorTo: yellow
@@ -7,7 +7,7 @@ sdk: gradio
 sdk_version: 5.32.0
 app_file: app.py
 pinned: false
-short_description: short description for your Space App
+short_description: SAM3 Video Inference on ZeroGPU
 ---
 
 # SAM3 HuggingFace Space Demo

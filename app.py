@@ -137,37 +137,20 @@ def video_inference(input_video, prompt: str):
     Segments objects in a video using a text prompt.
     Returns a list of detection dicts (one per object per frame) and output video path/status.
     """
-    if VID_MODEL is None or VID_PROCESSOR is None:
-        return {
-            "output_video": None,
-            "detections": [],
-            "status": "Video Models failed to load on startup.",
-        }
-    if input_video is None or not prompt:
-        return {
-            "output_video": None,
-            "detections": [],
-            "status": "Missing video or prompt.",
-        }
-    # try:
+    assert type(VID_MODEL) != type(None) and type(VID_PROCESSOR) != type(
+        None
+    ), "Video Models failed to load on startup."
+    assert input_video and prompt, "Missing video or prompt."
+
     # Gradio passes a dict with 'name' key for uploaded files
     video_path = (
         input_video if isinstance(input_video, str) else input_video.get("name", None)
     )
-    if not video_path:
-        return {
-            "output_video": None,
-            "detections": [],
-            "status": "Invalid video input.",
-        }
+    assert video_path, "Invalid video input."
+
     # Use FFmpeg-based helpers for metadata and frame extraction
     vmeta = get_video_metadata(video_path, bverbose=False)
-    if not vmeta:
-        return {
-            "output_video": None,
-            "detections": [],
-            "status": "Failed to extract video metadata.",
-        }
+    assert vmeta, "Failed to extract video metadata."
     vid_fps = vmeta["fps"]
     vid_w = vmeta["width"]
     vid_h = vmeta["height"]
@@ -181,12 +164,8 @@ def video_inference(input_video, prompt: str):
         write_frame_num=False,
         output_dir=None,
     )
-    if len(pil_frames) == 0:
-        return {
-            "output_video": None,
-            "detections": [],
-            "status": "No frames found in video.",
-        }
+    assert len(pil_frames) > 0, "No frames found in video."
+
     # Convert PIL Images to numpy arrays (RGB)
     video_frames = [np.array(frame.convert("RGB")) for frame in pil_frames]
 
@@ -195,9 +174,6 @@ def video_inference(input_video, prompt: str):
     )
     session = VID_PROCESSOR.add_text_prompt(inference_session=session, text=prompt)
     temp_out_path = tempfile.mktemp(suffix=".mp4")
-    # video_writer = cv2.VideoWriter(
-    #     temp_out_path, cv2.VideoWriter_fourcc(*"mp4v"), vid_fps, (vid_w, vid_h)
-    # )
 
     detections = []
     annotated_frames = []
@@ -213,7 +189,7 @@ def video_inference(input_video, prompt: str):
             object_ids = [int(oid) for oid in object_ids]
             if detected_masks.ndim == 4:
                 detected_masks = detected_masks.squeeze(1)
-            # detected_masks: (num_objects, H, W)
+
             for i, mask in enumerate(detected_masks):
                 mask = mask.cpu().numpy()
                 mask_bin = (mask > 0.0).astype(np.uint8)
@@ -237,10 +213,8 @@ def video_inference(input_video, prompt: str):
             )
         else:
             final_frame = original_pil
-        # video_writer.write(cv2.cvtColor(np.array(final_frame), cv2.COLOR_RGB2BGR))
         annotated_frames.append(final_frame)
 
-    # video_writer.release()
     return {
         "output_video": frames_to_vid(
             annotated_frames,
@@ -252,12 +226,6 @@ def video_inference(input_video, prompt: str):
         "detections": detections,
         "status": "Video processing completed successfully.✅",
     }
-    # except Exception as e:
-    #     return {
-    #         "output_video": None,
-    #         "detections": [],
-    #         "status": f"Error during video processing: {str(e)}",
-    #     }
 
 
 # the Gradio App
