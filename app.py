@@ -216,15 +216,15 @@ def video_inference(input_video, prompt: str, annotation_mode: bool = False):
         annotated_frames.append(final_frame)
 
     return (
-        detections
-        if annotation_mode
-        else frames_to_vid(
+        frames_to_vid(
             annotated_frames,
             output_path=temp_out_path,
             vid_fps=vid_fps,
             vid_h=vid_h,
             vid_w=vid_w,
         )
+        if annotation_mode
+        else detections
     )
 
 
