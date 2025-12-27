@@ -208,12 +208,14 @@ def video_inference(input_video, prompt: str, annotation_mode: bool = False):
                     "mask_b64": b64_mask_encode(mask_bin).decode("ascii"),
                 }
                 detections.append(det)
-            final_frame = apply_mask_overlay(
-                original_pil, detected_masks, object_ids=object_ids
+
+        if annotation_mode:
+            final_frame = (
+                apply_mask_overlay(original_pil, detected_masks, object_ids=object_ids)
+                if "masks" in post_processed
+                else original_pil
             )
-        else:
-            final_frame = original_pil
-        annotated_frames.append(final_frame)
+            annotated_frames.append(final_frame)
 
     return (
         frames_to_vid(
