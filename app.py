@@ -130,9 +130,9 @@ def frames_to_vid(pil_frames, output_path: str, vid_fps: int, vid_w: int, vid_h:
     return output_path
 
 
-def calc_timeout_duration(vid_file, *args):
+def calc_timeout_duration(vid_file, *args, **kwargs):
     sig = inspect.signature(video_inference)
-    bound = sig.bind(vid_file, *args)
+    bound = sig.bind(vid_file, *args, **kwargs)
     bound.apply_defaults()
     return bound.arguments.get("timeout_duration", 60)
 
