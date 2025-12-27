@@ -1,7 +1,7 @@
 # Import helpers for mask encoding and bbox extraction
+import inspect
 import sys
 import tempfile
-from ast import Return
 
 import cv2
 import gradio as gr
@@ -130,9 +130,21 @@ def frames_to_vid(pil_frames, output_path: str, vid_fps: int, vid_w: int, vid_h:
     return output_path
 
 
+def calc_timeout_duration(vid_file, *args):
+    sig = inspect.signature(video_inference)
+    bound = sig.bind(vid_file, *args)
+    bound.apply_defaults()
+    return bound.arguments.get("timeout_duration", 60)
+
+
 # Our Inference Function
-@spaces.GPU(duration=120)
-def video_inference(input_video, prompt: str, annotation_mode: bool = False):
+@spaces.GPU(duration=calc_timeout_duration)
+def video_inference(
+    input_video,
+    prompt: str,
+    timeout_duration: int = 60,
+    annotation_mode: bool = False,
+):
     """
     Segments objects in a video using a text prompt.
     Returns a list of detection dicts (one per object per frame) and output video path/status.
@@ -230,8 +242,10 @@ def video_inference(input_video, prompt: str, annotation_mode: bool = False):
     )
 
 
-def video_annotation(input_video, prompt: str):
-    return video_inference(input_video, prompt, annotation_mode=True)
+def video_annotation(input_video, prompt: str, timeout_duration: int = 60):
+    return video_inference(
+        input_video, prompt, timeout_duration=timeout_duration, annotation_mode=True
+    )
 
 
 # the Gradio App
@@ -247,6 +261,7 @@ with gr.Blocks() as app:
                     info="Describe the Object(s) you would like to track/ segmentate",
                     value="",
                 ),
+                gr.Radio([60, 120, 180, 240], value=60, label="Timeout (seconds)"),
             ],
             outputs=gr.JSON(label="Output JSON"),
             title="SAM3 Video Segmentation",
@@ -264,6 +279,7 @@ with gr.Blocks() as app:
                     info="Describe the Object(s) you would like to track/ segmentate",
                     value="",
                 ),
+                gr.Radio([60, 120, 180, 240], value=60, label="Timeout (seconds)"),
             ],
             outputs=gr.Video(label="Processed Video"),
             title="SAM3 Video Segmentation",
