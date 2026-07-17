@@ -360,7 +360,7 @@ def image_text_inference(
 ) -> list[dict]:
     """Segment every instance of a concept in a single image with SAM3 using a natural-language text prompt (concept segmentation).
 
-    The prompt is a concept to find (e.g. "player in white", "red car"); each matching instance becomes one detection. Returns a JSON list of detection objects, each with: "track_id" (integer index of the instance within this image); "x", "y", "w", "h" (floats); "conf" (float 0-1 detection score); and "mask_b64" (string). The bounding box ("x","y","w","h") is NORMALIZED 0-1: (x, y) is the top-left corner and (w, h) is the box size, each divided by the image width/height -- i.e. the albumentations "coco" layout [x_min, y_min, width, height] but normalized to 0-1 rather than absolute pixels, and NOT the "pascal_voc" [x_min, y_min, x_max, y_max] layout. Bounding-box formats are documented at https://albumentations.ai/docs/3-basic-usage/bounding-boxes-augmentations/#bounding-box-formats . "mask_b64" is a base64-encoded 1-bit PNG of the binary segmentation mask at the input image resolution; decode it with PIL, e.g. numpy.array(Image.open(io.BytesIO(base64.b64decode(mask_b64)))) to get a 0/255 mask.
+    The prompt is a concept to find (e.g. "player in white", "red car"); each matching instance becomes one detection. Returns a JSON list of detection objects, each with: "object_id" (integer index of the instance within this image); "x", "y", "w", "h" (floats); "conf" (float 0-1 detection score); and "mask_b64" (string). The bounding box ("x","y","w","h") is NORMALIZED 0-1: (x, y) is the top-left corner and (w, h) is the box size, each divided by the image width/height -- i.e. the albumentations "coco" layout [x_min, y_min, width, height] but normalized to 0-1 rather than absolute pixels, and NOT the "pascal_voc" [x_min, y_min, x_max, y_max] layout. Bounding-box formats are documented at https://albumentations.ai/docs/3-basic-usage/bounding-boxes-augmentations/#bounding-box-formats . "mask_b64" is a base64-encoded 1-bit PNG of the binary segmentation mask at the input image resolution; decode it with PIL, e.g. numpy.array(Image.open(io.BytesIO(base64.b64decode(mask_b64)))) to get a 0/255 mask.
 
     Args:
         im: The RGB image to segment (a PIL Image).
@@ -396,7 +396,7 @@ def image_text_inference(
         x0, y0, x1, y1 = xyxy
         detections.append(
             {
-                "track_id": i,
+                "object_id": i,
                 "x": x0 / img_w,
                 "y": y0 / img_h,
                 "w": (x1 - x0) / img_w,
