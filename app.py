@@ -164,10 +164,16 @@ def video_inference(
     prompt: str,
     timeout_duration: int = 60,
     annotation_mode: bool = False,
-):
-    """
-    Segments objects in a video using a text prompt.
-    Returns a list of detection dicts (one per object per frame) and output video path/status.
+) -> list[dict] | str:
+    """Track and segment objects across a video with SAM3 using a natural-language text prompt, returning per-object-per-frame detections (or an annotated video).
+
+    The prompt is a concept to find (e.g. "player in white", "red car"); every matching instance is tracked across all frames with a stable track_id. This tool has two output shapes selected by annotation_mode. When annotation_mode is false (default) it returns a JSON list of detection objects, one per tracked object per frame. Each detection has: "frame" (integer, 0-based frame index); "track_id" (integer, stable across frames for one object); "x", "y", "w", "h" (floats); "conf" (float, always 1 for video); and "mask_b64" (string). The bounding box ("x","y","w","h") is NORMALIZED 0-1: (x, y) is the top-left corner and (w, h) is the box size, each divided by the video width/height -- i.e. the albumentations "coco" layout [x_min, y_min, width, height] but normalized to 0-1 rather than absolute pixels, and NOT the "pascal_voc" [x_min, y_min, x_max, y_max] layout. Bounding-box formats are documented at https://albumentations.ai/docs/3-basic-usage/bounding-boxes-augmentations/#bounding-box-formats . "mask_b64" is a base64-encoded 1-bit PNG of the binary segmentation mask at the frame resolution; decode it with PIL, e.g. numpy.array(Image.open(io.BytesIO(base64.b64decode(mask_b64)))) to get a 0/255 mask. When annotation_mode is true it instead returns a filesystem path to an mp4 video with the colored mask overlays burned in.
+
+    Args:
+        input_video: The input video to segment (a file path, or an uploaded-file object with a "name" key).
+        prompt: Natural-language description of the object(s) to track/segment, e.g. "player in white".
+        timeout_duration: Max GPU lease in seconds for this request (60, 120, 180, or 240); longer videos need more.
+        annotation_mode: If false (default) return the JSON detections list; if true return a path to an annotated mp4 with mask overlays.
     """
     assert type(VID_MODEL) != type(None) and type(VID_PROCESSOR) != type(
         None
@@ -262,7 +268,16 @@ def video_inference(
     )
 
 
-def video_annotation(input_video, prompt: str, timeout_duration: int = 60):
+def video_annotation(input_video, prompt: str, timeout_duration: int = 60) -> str:
+    """Track and segment objects across a video with SAM3 using a natural-language text prompt, and return an annotated video with the segmentation masks overlaid.
+
+    The prompt is a concept to find (e.g. "player in white", "red car"); every matching instance is tracked across all frames and rendered as a colored mask overlay (color keyed by object). This is the annotated-video counterpart of video_inference: it returns a filesystem path to an mp4 with the mask overlays burned in, rather than JSON detections. Use video_inference (annotation_mode false) instead if you need the structured per-frame bounding boxes and base64 masks.
+
+    Args:
+        input_video: The input video to segment (a file path, or an uploaded-file object with a "name" key).
+        prompt: Natural-language description of the object(s) to track/segment, e.g. "player in white".
+        timeout_duration: Max GPU lease in seconds for this request (60, 120, 180, or 240); longer videos need more.
+    """
     return video_inference(
         input_video, prompt, timeout_duration=timeout_duration, annotation_mode=True
     )
@@ -275,22 +290,17 @@ def image_visual_inference(
     bboxes=None,
     points=None,
     point_labels=None,
-):
-    """
-    SAM3 image segmentation with visual prompts (points and/or boxes).
+) -> list[str]:
+    """Segment objects in a single image with SAM3 using visual prompts (bounding boxes and/or points); a drop-in match for SAM2's process_image.
 
-    Drop-in match for SAM2's `process_image`:
+    Provide at least one of bboxes or points. Each bounding box produces its own mask; all points together describe one object and produce a single mask. The return value is a JSON list of base64-encoded 1-bit-PNG mask strings, ordered as: one mask per bounding box (in the order the boxes were given), then, if points were provided, one final mask for the points prompt. Each string decodes to a binary segmentation mask at the input image resolution; decode it with PIL, e.g. numpy.array(Image.open(io.BytesIO(base64.b64decode(mask_b64)))) to get a 0/255 mask. Box pixel coordinates use (x0, y0) = top-left and (x1, y1) = bottom-right corners of the ORIGINAL input image (albumentations "pascal_voc" [x_min, y_min, x_max, y_max], absolute pixels); point coordinates (x, y) are absolute pixels in the same image. Coordinate formats are documented at https://albumentations.ai/docs/3-basic-usage/bounding-boxes-augmentations/#bounding-box-formats .
 
     Args:
-        im: Pillow Image
-        variant: accepted for SAM2 API parity; ignored (SAM3 has a single model)
-        bboxes: bounding boxes to segment, as a list of dicts (or JSON string):
-            [{"x0":..., "y0":..., "x1":..., "y1":...}, ...] -- one mask per box
-        points: points to segment, as a list of dicts (or JSON string):
-            [{"x":..., "y":...}, ...] -- all points describe a single object/mask
-        point_labels: list of ints (or JSON string), 1=foreground, 0=background
-    Returns:
-        list: a list of base64-encoded mask strings (one per box, then one for points)
+        im: The RGB image to segment (a PIL Image).
+        variant: Accepted for SAM2 API parity and ignored; SAM3 has a single model.
+        bboxes: Bounding-box prompts as a list of dicts (or a JSON string), each dict {"x0","y0","x1","y1"} in absolute pixels; one output mask per box.
+        points: Point prompts as a list of dicts (or a JSON string), each dict {"x","y"} in absolute pixels; all points together define a single object/mask.
+        point_labels: List of ints (or a JSON string) parallel to points, 1=foreground and 0=background; required whenever points is given.
     """
     assert TRK_MODEL is not None and TRK_PROCESSOR is not None, (
         "Image tracker model failed to load on startup."
@@ -345,17 +355,17 @@ def image_visual_inference(
 
 
 @spaces.GPU
-def image_text_inference(im: Image.Image, prompt: str, conf_threshold: float = 0.5):
-    """
-    SAM3 image segmentation with a text prompt (concept segmentation).
+def image_text_inference(
+    im: Image.Image, prompt: str, conf_threshold: float = 0.5
+) -> list[dict]:
+    """Segment every instance of a concept in a single image with SAM3 using a natural-language text prompt (concept segmentation).
+
+    The prompt is a concept to find (e.g. "player in white", "red car"); each matching instance becomes one detection. Returns a JSON list of detection objects, each with: "track_id" (integer index of the instance within this image); "x", "y", "w", "h" (floats); "conf" (float 0-1 detection score); and "mask_b64" (string). The bounding box ("x","y","w","h") is NORMALIZED 0-1: (x, y) is the top-left corner and (w, h) is the box size, each divided by the image width/height -- i.e. the albumentations "coco" layout [x_min, y_min, width, height] but normalized to 0-1 rather than absolute pixels, and NOT the "pascal_voc" [x_min, y_min, x_max, y_max] layout. Bounding-box formats are documented at https://albumentations.ai/docs/3-basic-usage/bounding-boxes-augmentations/#bounding-box-formats . "mask_b64" is a base64-encoded 1-bit PNG of the binary segmentation mask at the input image resolution; decode it with PIL, e.g. numpy.array(Image.open(io.BytesIO(base64.b64decode(mask_b64)))) to get a 0/255 mask.
 
     Args:
-        im: Pillow Image
-        prompt: concept to segment, e.g. "player in white"
-        conf_threshold: score threshold for kept instances
-    Returns:
-        list: detection dicts [{"track_id":..., "x":..., "y":..., "w":..., "h":...,
-              "conf":..., "mask_b64":...}, ...] with normalized x/y/w/h
+        im: The RGB image to segment (a PIL Image).
+        prompt: Natural-language concept to segment, e.g. "player in white"; all matching instances are returned.
+        conf_threshold: Minimum detection score from 0.0 to 1.0; instances scoring below this are discarded.
     """
     assert IMG_MODEL is not None and IMG_PROCESSOR is not None, (
         "Image text model failed to load on startup."
