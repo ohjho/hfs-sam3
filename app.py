@@ -283,7 +283,6 @@ def video_annotation(input_video, prompt: str, timeout_duration: int = 60) -> st
     )
 
 
-@spaces.GPU
 def image_visual_inference(
     im: Image.Image,
     variant=None,
@@ -339,6 +338,11 @@ def image_visual_inference(
         proc_kwargs["input_points"] = [[[[p["x"], p["y"]] for p in points]]]
         proc_kwargs["input_labels"] = [[list(point_labels)]]
 
+    return _gpu_image_visual_inference(im, proc_kwargs)
+
+
+@spaces.GPU(duration=20)
+def _gpu_image_visual_inference(im: Image.Image, proc_kwargs: dict) -> list[str]:
     inputs = TRK_PROCESSOR(
         images=im.convert("RGB"), return_tensors="pt", **proc_kwargs
     ).to(DEVICE)
@@ -354,7 +358,6 @@ def image_visual_inference(
     return [b64_mask_encode(m).decode("ascii") for m in output_masks]
 
 
-@spaces.GPU
 def image_text_inference(
     im: Image.Image, prompt: str, conf_threshold: float = 0.5
 ) -> list[dict]:
@@ -373,6 +376,13 @@ def image_text_inference(
     assert im is not None and prompt, "Missing image or prompt."
 
     pil_image = im.convert("RGB")
+    return _gpu_image_text_inference(pil_image, prompt, conf_threshold)
+
+
+@spaces.GPU(duration=20)
+def _gpu_image_text_inference(
+    pil_image: Image.Image, prompt: str, conf_threshold: float
+) -> list[dict]:
     inputs = IMG_PROCESSOR(
         images=pil_image, text=prompt, return_tensors="pt"
     ).to(DEVICE)
