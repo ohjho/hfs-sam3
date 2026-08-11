@@ -1,6 +1,7 @@
 # Import helpers for mask encoding and bbox extraction
 import inspect
 import json
+import math
 import sys
 import tempfile
 
@@ -150,11 +151,60 @@ def frames_to_vid(pil_frames, output_path: str, vid_fps: int, vid_w: int, vid_h:
     return output_path
 
 
-def calc_timeout_duration(vid_file, *args, **kwargs):
+def calc_effective_fps(vid_fps: float, sample_fps: float = None, every_x: int = None):
+    """FPS the video is actually sampled at after the optional downsampling filters."""
+    # empty/0 gr.Number must not activate the filters
+    sample_fps = sample_fps or None
+    every_x = int(every_x) if every_x else None
+    if sample_fps:
+        return min(float(sample_fps), vid_fps)
+    if every_x:
+        return vid_fps / every_x
+    return vid_fps
+
+
+# Rough GPU seconds per propagated frame for SAM3, incl. CPU->GPU frame streaming and mask
+# post-processing. Tune from Space logs: an underestimate kills the task mid-run (wasting
+# the whole billed window), an overestimate only raises the quota gate / queue penalty for
+# callers.
+GPU_DURATION_PER_FRAME_S = 0.5
+GPU_DURATION_OVERHEAD_S = 20  # ffmpeg extraction + session preprocessing
+GPU_DURATION_MIN_S = 30
+GPU_DURATION_MAX_S = 300  # videos estimated above this should be downsampled instead
+GPU_DURATION_FALLBACK_S = 120  # metadata probe failed
+
+
+def calc_timeout_duration(input_video, *args, **kwargs):
+    # spaces calls this with video_inference's args in the main process, before the GPU is
+    # requested (probe time is not billed) — keep the binding in sync with its signature.
     sig = inspect.signature(video_inference)
-    bound = sig.bind(vid_file, *args, **kwargs)
+    bound = sig.bind(input_video, *args, **kwargs)
     bound.apply_defaults()
-    return bound.arguments.get("timeout_duration", 60)
+    timeout_duration = bound.arguments.get("timeout_duration")
+    if timeout_duration:  # explicit user value is a hard override
+        return int(timeout_duration)
+    try:
+        video_path = (
+            input_video
+            if isinstance(input_video, str)
+            else (input_video or {}).get("name")
+        )
+        vmeta = get_video_metadata(video_path, bverbose=False) if video_path else None
+    except Exception as e:
+        logger.warning(f"video probe failed ({e}); falling back to fixed GPU duration")
+        vmeta = None
+    if not vmeta or not vmeta.get("fps") or not vmeta.get("duration"):
+        return GPU_DURATION_FALLBACK_S
+    effective_fps = calc_effective_fps(
+        vmeta["fps"],
+        sample_fps=bound.arguments.get("sample_fps"),
+        every_x=bound.arguments.get("every_x"),
+    )
+    n_frames = math.ceil(vmeta["duration"] * effective_fps)
+    est = GPU_DURATION_OVERHEAD_S + n_frames * GPU_DURATION_PER_FRAME_S
+    duration = max(GPU_DURATION_MIN_S, min(GPU_DURATION_MAX_S, math.ceil(est)))
+    logger.info(f"requesting {duration}s of GPU time for ~{n_frames} frames")
+    return duration
 
 
 # Our Inference Function
@@ -162,17 +212,23 @@ def calc_timeout_duration(vid_file, *args, **kwargs):
 def video_inference(
     input_video,
     prompt: str,
-    timeout_duration: int = 60,
+    timeout_duration: int = None,
+    sample_fps: float = None,
+    every_x: int = None,
+    video_load_device: str = "cpu",
     annotation_mode: bool = False,
 ) -> list[dict] | str:
     """Track and segment objects across a video with SAM3 using a natural-language text prompt, returning per-object-per-frame detections (or an annotated video).
 
-    The prompt is a concept to find (e.g. "player in white", "red car"); every matching instance is tracked across all frames with a stable track_id. This tool has two output shapes selected by annotation_mode. When annotation_mode is false (default) it returns a JSON list of detection objects, one per tracked object per frame. Each detection has: "frame" (integer, 0-based frame index); "track_id" (integer, stable across frames for one object); "x", "y", "w", "h" (floats); "conf" (float, always 1 for video); and "mask_b64" (string). The bounding box ("x","y","w","h") is NORMALIZED 0-1: (x, y) is the top-left corner and (w, h) is the box size, each divided by the video width/height -- i.e. the albumentations "coco" layout [x_min, y_min, width, height] but normalized to 0-1 rather than absolute pixels, and NOT the "pascal_voc" [x_min, y_min, x_max, y_max] layout. Bounding-box formats are documented at https://albumentations.ai/docs/3-basic-usage/bounding-boxes-augmentations/#bounding-box-formats . "mask_b64" is a base64-encoded 1-bit PNG of the binary segmentation mask at the frame resolution; decode it with PIL, e.g. numpy.array(Image.open(io.BytesIO(base64.b64decode(mask_b64)))) to get a 0/255 mask. When annotation_mode is true it instead returns a filesystem path to an mp4 video with the colored mask overlays burned in.
+    The prompt is a concept to find (e.g. "player in white", "red car"); every matching instance is tracked across all frames with a stable track_id. The video can optionally be downsampled before tracking with sample_fps or every_x; the "frame" field of every detection is a 0-based position in the SAMPLED frame sequence, NOT an original video frame number, so with every_x=5 the detection "frame": 2 corresponds to original frame 10. This tool has two output shapes selected by annotation_mode. When annotation_mode is false (default) it returns a JSON list of detection objects, one per tracked object per frame. Each detection has: "frame" (integer sampled-frame index as defined above); "track_id" (integer, stable across frames for one object); "x", "y", "w", "h" (floats); "conf" (float, always 1 for video); and "mask_b64" (string). The bounding box ("x","y","w","h") is NORMALIZED 0-1: (x, y) is the top-left corner and (w, h) is the box size, each divided by the video width/height -- i.e. the albumentations "coco" layout [x_min, y_min, width, height] but normalized to 0-1 rather than absolute pixels, and NOT the "pascal_voc" [x_min, y_min, x_max, y_max] layout. Bounding-box formats are documented at https://albumentations.ai/docs/3-basic-usage/bounding-boxes-augmentations/#bounding-box-formats . "mask_b64" is a base64-encoded 1-bit PNG of the binary segmentation mask at the frame resolution; decode it with PIL, e.g. numpy.array(Image.open(io.BytesIO(base64.b64decode(mask_b64)))) to get a 0/255 mask. When annotation_mode is true it instead returns a filesystem path to an mp4 video with the colored mask overlays burned in.
 
     Args:
         input_video: The input video to segment (a file path, or an uploaded-file object with a "name" key).
         prompt: Natural-language description of the object(s) to track/segment, e.g. "player in white".
-        timeout_duration: Max GPU lease in seconds for this request (60, 120, 180, or 240); longer videos need more.
+        timeout_duration: Max GPU lease in seconds for this request, used as a hard override; leave empty to auto-estimate it from the video length and downsampling settings.
+        sample_fps: Sample the video down to roughly this many frames per second before tracking (clamped to the source fps; takes precedence over every_x); leave empty to keep every frame.
+        every_x: Keep only every Nth frame of the video before tracking, e.g. 5 keeps original frames 0, 5, 10, ... (ignored when sample_fps is set); leave empty to keep every frame.
+        video_load_device: Device the video frames are preprocessed and stored on: "cpu" (default) streams frames to the GPU one at a time and keeps GPU memory low; "cuda" holds the whole preprocessed video in GPU memory, which is faster per frame but runs out of GPU memory on long videos.
         annotation_mode: If false (default) return the JSON detections list; if true return a path to an annotated mp4 with mask overlays.
     """
     assert type(VID_MODEL) != type(None) and type(VID_PROCESSOR) != type(
@@ -192,11 +248,12 @@ def video_inference(
     vid_fps = vmeta["fps"]
     vid_w = vmeta["width"]
     vid_h = vmeta["height"]
+    effective_fps = calc_effective_fps(vid_fps, sample_fps=sample_fps, every_x=every_x)
 
     # Extract frames as PIL Images (no timestamp/frame_num overlays)
     pil_frames = extract_frames(
         video_path,
-        fps=int(vid_fps),
+        fps=effective_fps,
         max_short_edge=min(vid_w, vid_h),
         write_timestamp=False,
         write_frame_num=False,
@@ -208,7 +265,17 @@ def video_inference(
     video_frames = [np.array(frame.convert("RGB")) for frame in pil_frames]
 
     session = VID_PROCESSOR.init_video_session(
-        video=video_frames, inference_device=DEVICE, dtype=DTYPE
+        video=video_frames,
+        inference_device=DEVICE,
+        # Preprocessing/storing the full video on cuda (the transformers default when only
+        # inference_device is set) OOMs on long videos — normalizing hundreds of frames
+        # needs tens of GB transiently. Keep frames on video_load_device ("cpu" by
+        # default); get_frame streams each one to inference_device on access.
+        processing_device=video_load_device,
+        video_storage_device=video_load_device,
+        # Per-frame outputs accumulate over the whole video — park them in RAM as well.
+        inference_state_device="cpu",
+        dtype=DTYPE,
     )
     session = VID_PROCESSOR.add_text_prompt(inference_session=session, text=prompt)
     temp_out_path = tempfile.mktemp(suffix=".mp4")
@@ -259,7 +326,8 @@ def video_inference(
         frames_to_vid(
             annotated_frames,
             output_path=temp_out_path,
-            vid_fps=vid_fps,
+            # mux at the sampled fps so a downsampled video keeps real-time duration
+            vid_fps=effective_fps,
             vid_h=vid_h,
             vid_w=vid_w,
         )
@@ -268,18 +336,34 @@ def video_inference(
     )
 
 
-def video_annotation(input_video, prompt: str, timeout_duration: int = 60) -> str:
+def video_annotation(
+    input_video,
+    prompt: str,
+    timeout_duration: int = None,
+    sample_fps: float = None,
+    every_x: int = None,
+    video_load_device: str = "cpu",
+) -> str:
     """Track and segment objects across a video with SAM3 using a natural-language text prompt, and return an annotated video with the segmentation masks overlaid.
 
-    The prompt is a concept to find (e.g. "player in white", "red car"); every matching instance is tracked across all frames and rendered as a colored mask overlay (color keyed by object). This is the annotated-video counterpart of video_inference: it returns a filesystem path to an mp4 with the mask overlays burned in, rather than JSON detections. Use video_inference (annotation_mode false) instead if you need the structured per-frame bounding boxes and base64 masks.
+    The prompt is a concept to find (e.g. "player in white", "red car"); every matching instance is tracked across all frames and rendered as a colored mask overlay (color keyed by object). The video can optionally be downsampled before tracking with sample_fps or every_x; the returned video then contains only the sampled frames, muxed at the sampled frame rate so it keeps the original real-time duration. This is the annotated-video counterpart of video_inference: it returns a filesystem path to an mp4 with the mask overlays burned in, rather than JSON detections. Use video_inference instead if you need the structured per-frame bounding boxes and base64 masks.
 
     Args:
         input_video: The input video to segment (a file path, or an uploaded-file object with a "name" key).
         prompt: Natural-language description of the object(s) to track/segment, e.g. "player in white".
-        timeout_duration: Max GPU lease in seconds for this request (60, 120, 180, or 240); longer videos need more.
+        timeout_duration: Max GPU lease in seconds for this request, used as a hard override; leave empty to auto-estimate it from the video length and downsampling settings.
+        sample_fps: Sample the video down to roughly this many frames per second before tracking (clamped to the source fps; takes precedence over every_x); leave empty to keep every frame.
+        every_x: Keep only every Nth frame of the video before tracking, e.g. 5 keeps original frames 0, 5, 10, ... (ignored when sample_fps is set); leave empty to keep every frame.
+        video_load_device: Device the video frames are preprocessed and stored on: "cpu" (default) streams frames to the GPU one at a time and keeps GPU memory low; "cuda" holds the whole preprocessed video in GPU memory, which is faster per frame but runs out of GPU memory on long videos.
     """
     return video_inference(
-        input_video, prompt, timeout_duration=timeout_duration, annotation_mode=True
+        input_video,
+        prompt,
+        timeout_duration=timeout_duration,
+        sample_fps=sample_fps,
+        every_x=every_x,
+        video_load_device=video_load_device,
+        annotation_mode=True,
     )
 
 
@@ -431,7 +515,29 @@ with gr.Blocks() as app:
                     info="Describe the Object(s) you would like to track/ segmentate",
                     value="",
                 ),
-                gr.Radio([60, 120, 180, 240], value=60, label="Timeout (seconds)"),
+                gr.Number(
+                    label="Timeout Override (seconds)",
+                    info="max GPU lease; leave empty to auto-estimate from video length and downsampling",
+                    value=None,
+                    precision=0,
+                ),
+                gr.Number(
+                    label="Sample FPS",
+                    info="downsample the video to this many frames per second before tracking; empty = every frame",
+                    value=None,
+                ),
+                gr.Number(
+                    label="Every Xth Frame",
+                    info="keep only every Nth frame before tracking; ignored when Sample FPS is set",
+                    value=None,
+                    precision=0,
+                ),
+                gr.Dropdown(
+                    label="Video Load Device",
+                    info="where preprocessed frames are stored; cpu streams them to the GPU per frame",
+                    choices=["cpu", "cuda"],
+                    value="cpu",
+                ),
             ],
             outputs=gr.JSON(label="Output JSON"),
             title="SAM3 Video Segmentation",
@@ -449,7 +555,29 @@ with gr.Blocks() as app:
                     info="Describe the Object(s) you would like to track/ segmentate",
                     value="",
                 ),
-                gr.Radio([60, 120, 180, 240], value=60, label="Timeout (seconds)"),
+                gr.Number(
+                    label="Timeout Override (seconds)",
+                    info="max GPU lease; leave empty to auto-estimate from video length and downsampling",
+                    value=None,
+                    precision=0,
+                ),
+                gr.Number(
+                    label="Sample FPS",
+                    info="downsample the video to this many frames per second before tracking; empty = every frame",
+                    value=None,
+                ),
+                gr.Number(
+                    label="Every Xth Frame",
+                    info="keep only every Nth frame before tracking; ignored when Sample FPS is set",
+                    value=None,
+                    precision=0,
+                ),
+                gr.Dropdown(
+                    label="Video Load Device",
+                    info="where preprocessed frames are stored; cpu streams them to the GPU per frame",
+                    choices=["cpu", "cuda"],
+                    value="cpu",
+                ),
             ],
             outputs=gr.Video(label="Processed Video"),
             title="SAM3 Video Segmentation",
