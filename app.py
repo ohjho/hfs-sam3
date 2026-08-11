@@ -18,6 +18,8 @@ from transformers import (
     Sam3Processor,
     Sam3TrackerModel,
     Sam3TrackerProcessor,
+    Sam3TrackerVideoModel,
+    Sam3TrackerVideoProcessor,
     Sam3VideoModel,
     Sam3VideoProcessor,
 )
@@ -26,7 +28,7 @@ from transformers import (
 from ffmpeg_extractor import extract_frames, get_video_metadata
 
 # import local helpers
-from toolbox.mask_encoding import b64_mask_encode
+from toolbox.mask_encoding import b64_mask_decode, b64_mask_encode
 from visualizer import mask_to_xyxy
 
 logger.remove()
@@ -67,6 +69,19 @@ except Exception as e:
     IMG_PROCESSOR = None
     TRK_MODEL = None
     TRK_PROCESSOR = None
+
+try:
+    # Visual-prompt video tracking (mask prompts, SAM2-style PVS); same checkpoint —
+    # the class pulls the tracker weights out and drops the detector head.
+    TRK_VID_MODEL = Sam3TrackerVideoModel.from_pretrained("facebook/sam3").to(
+        DEVICE, dtype=DTYPE
+    )
+    TRK_VID_PROCESSOR = Sam3TrackerVideoProcessor.from_pretrained("facebook/sam3")
+    logger.success("Tracker Video Model and Processor Loaded!")
+except Exception as e:
+    logger.error(f"❌ CRITICAL ERROR LOADING TRACKER VIDEO MODEL: {e}")
+    TRK_VID_MODEL = None
+    TRK_VID_PROCESSOR = None
 
 
 def apply_mask_overlay(base_image, mask_data, object_ids=None, opacity=0.5):
@@ -174,13 +189,11 @@ GPU_DURATION_MAX_S = 300  # videos estimated above this should be downsampled in
 GPU_DURATION_FALLBACK_S = 120  # metadata probe failed
 
 
-def calc_timeout_duration(input_video, *args, **kwargs):
-    # spaces calls this with video_inference's args in the main process, before the GPU is
-    # requested (probe time is not billed) — keep the binding in sync with its signature.
-    sig = inspect.signature(video_inference)
-    bound = sig.bind(input_video, *args, **kwargs)
-    bound.apply_defaults()
-    timeout_duration = bound.arguments.get("timeout_duration")
+def _estimate_gpu_duration(
+    input_video, timeout_duration=None, sample_fps=None, every_x=None, extra_steps=0
+):
+    """Estimate the GPU lease from the probed video length and downsampling; runs in the
+    main process before the GPU is requested (probe time is not billed)."""
     if timeout_duration:  # explicit user value is a hard override
         return int(timeout_duration)
     try:
@@ -196,15 +209,43 @@ def calc_timeout_duration(input_video, *args, **kwargs):
     if not vmeta or not vmeta.get("fps") or not vmeta.get("duration"):
         return GPU_DURATION_FALLBACK_S
     effective_fps = calc_effective_fps(
-        vmeta["fps"],
+        vmeta["fps"], sample_fps=sample_fps, every_x=every_x
+    )
+    steps = math.ceil(vmeta["duration"] * effective_fps) + extra_steps
+    est = GPU_DURATION_OVERHEAD_S + steps * GPU_DURATION_PER_FRAME_S
+    duration = max(GPU_DURATION_MIN_S, min(GPU_DURATION_MAX_S, math.ceil(est)))
+    logger.info(f"requesting {duration}s of GPU time for ~{steps} propagation steps")
+    return duration
+
+
+def calc_timeout_duration(input_video, *args, **kwargs):
+    # spaces calls this with video_inference's args — keep the binding in sync with its
+    # signature.
+    sig = inspect.signature(video_inference)
+    bound = sig.bind(input_video, *args, **kwargs)
+    bound.apply_defaults()
+    return _estimate_gpu_duration(
+        input_video,
+        timeout_duration=bound.arguments.get("timeout_duration"),
         sample_fps=bound.arguments.get("sample_fps"),
         every_x=bound.arguments.get("every_x"),
     )
-    n_frames = math.ceil(vmeta["duration"] * effective_fps)
-    est = GPU_DURATION_OVERHEAD_S + n_frames * GPU_DURATION_PER_FRAME_S
-    duration = max(GPU_DURATION_MIN_S, min(GPU_DURATION_MAX_S, math.ceil(est)))
-    logger.info(f"requesting {duration}s of GPU time for ~{n_frames} frames")
-    return duration
+
+
+def calc_visual_timeout_duration(input_video, *args, **kwargs):
+    # spaces calls this with video_visual_inference's args — keep the binding in sync with
+    # its signature.
+    sig = inspect.signature(video_visual_inference)
+    bound = sig.bind(input_video, *args, **kwargs)
+    bound.apply_defaults()
+    return _estimate_gpu_duration(
+        input_video,
+        timeout_duration=bound.arguments.get("timeout_duration"),
+        sample_fps=bound.arguments.get("sample_fps"),
+        every_x=bound.arguments.get("every_x"),
+        # a nonzero ref frame adds the reverse pass (ref..0) on top of the forward one
+        extra_steps=int(bound.arguments.get("ref_frame_idx") or 0),
+    )
 
 
 # Our Inference Function
@@ -365,6 +406,134 @@ def video_annotation(
         video_load_device=video_load_device,
         annotation_mode=True,
     )
+
+
+@spaces.GPU(duration=calc_visual_timeout_duration)
+def video_visual_inference(
+    input_video,
+    masks: str | list,
+    drop_masks: bool = False,
+    ref_frame_idx: int = 0,
+    timeout_duration: int = None,
+    sample_fps: float = None,
+    every_x: int = None,
+    video_load_device: str = "cpu",
+) -> list[dict]:
+    """SAM3 video segmentation with visual prompts: track objects through a video given their segmentation masks on a reference frame; a drop-in match for SAM2's process_video.
+
+    Seed the objects to track by supplying their masks on the reference frame (ref_frame_idx); SAM3 then propagates each object forward -- and, when ref_frame_idx is nonzero, also backward -- through every frame. Unlike video_inference (which finds objects from a text prompt), this tool tracks exactly the objects whose masks you provide, e.g. masks obtained from image_visual_inference or image_text_inference on the reference frame. The video can optionally be downsampled before tracking with sample_fps or every_x; all frame indices (the "frame" field of every detection AND the ref_frame_idx input) are 0-based positions in the SAMPLED frame sequence, NOT original video frame numbers, so with every_x=5 the detection "frame": 2 corresponds to original frame 10. Returns a JSON list of per-frame detections, one entry per tracked object per frame in which it appears (frames where an object is absent are skipped). Each detection is a dict with: "frame" (integer sampled-frame index as defined above); "track_id" (integer object id matching the position of the seed mask in the masks input, stable across frames); "x", "y", "w", "h" (the object's bounding box as top-left-x, top-left-y, width, height, each NORMALIZED to 0.0-1.0 by dividing by the frame width or height -- this is the albumentations "coco" layout [x_min, y_min, width, height] but normalized to 0-1 rather than absolute pixels, and it is NOT [x_min, y_min, x_max, y_max]; box formats documented at https://albumentations.ai/docs/3-basic-usage/bounding-boxes-augmentations/#bounding-box-formats ); "conf" (always 1); and, unless drop_masks is true, "mask_b64" (a base64-encoded 1-bit PNG string the same width and height as the video frame, 1 inside the object and 0 elsewhere).
+
+    Args:
+        input_video: The input video to segment (a file path, or an uploaded-file object with a "name" key).
+        masks: JSON list of base64-encoded 1-bit PNG masks for the reference frame, one per object to track, e.g. ["b'iVBORw0KGgo...'", ...]; the b'...' literal wrapper is accepted and stripped.
+        drop_masks: When true, omit the "mask_b64" field from every detection so only bounding-box information is returned.
+        ref_frame_idx: Index of the frame the provided masks correspond to, counted in the SAMPLED frame sequence when sample_fps or every_x is set; a nonzero value triggers bidirectional tracking (forward and backward from this frame).
+        timeout_duration: Max GPU lease in seconds for this request, used as a hard override; leave empty to auto-estimate it from the video length, downsampling settings, and ref_frame_idx.
+        sample_fps: Sample the video down to roughly this many frames per second before tracking (clamped to the source fps; takes precedence over every_x); leave empty to keep every frame.
+        every_x: Keep only every Nth frame of the video before tracking, e.g. 5 keeps original frames 0, 5, 10, ... (ignored when sample_fps is set); leave empty to keep every frame.
+        video_load_device: Device the video frames are preprocessed and stored on: "cpu" (default) streams frames to the GPU one at a time and keeps GPU memory low; "cuda" holds the whole preprocessed video in GPU memory, which is faster per frame but runs out of GPU memory on long videos.
+    """
+    assert TRK_VID_MODEL is not None and TRK_VID_PROCESSOR is not None, (
+        "Tracker video model failed to load on startup."
+    )
+    assert input_video and masks, "Missing video or masks."
+    video_path = (
+        input_video if isinstance(input_video, str) else input_video.get("name", None)
+    )
+    assert video_path, "Invalid video input."
+
+    masks = json.loads(masks) if isinstance(masks, str) else masks
+    masks = [
+        m[2:-1].encode() if m.startswith("b'") and m.endswith("'") else m for m in masks
+    ]  # expect the b'' literal to be included
+    masks = [b64_mask_decode(m).astype(bool) for m in masks]
+
+    vmeta = get_video_metadata(video_path, bverbose=False)
+    assert vmeta, "Failed to extract video metadata."
+    vid_fps = vmeta["fps"]
+    vid_w = vmeta["width"]
+    vid_h = vmeta["height"]
+    effective_fps = calc_effective_fps(vid_fps, sample_fps=sample_fps, every_x=every_x)
+
+    pil_frames = extract_frames(
+        video_path,
+        fps=effective_fps,
+        max_short_edge=min(vid_w, vid_h),
+        write_timestamp=False,
+        write_frame_num=False,
+        output_dir=None,
+    )
+    assert len(pil_frames) > 0, "No frames found in video."
+    ref_frame_idx = int(ref_frame_idx or 0)
+    assert 0 <= ref_frame_idx < len(pil_frames), (
+        f"ref_frame_idx {ref_frame_idx} out of range for "
+        f"{len(pil_frames)} sampled frames."
+    )
+    video_frames = [np.array(frame.convert("RGB")) for frame in pil_frames]
+
+    session = TRK_VID_PROCESSOR.init_video_session(
+        video=video_frames,
+        inference_device=DEVICE,
+        # same OOM guard as video_inference: keep frames + per-frame state off the GPU
+        processing_device=video_load_device,
+        video_storage_device=video_load_device,
+        inference_state_device="cpu",
+        dtype=DTYPE,
+    )
+    # Seed every object in a single call — add_inputs_to_inference_session overwrites
+    # session.obj_with_new_inputs on each call, so seeding masks one-per-call would leave
+    # only the last object registered as "new".
+    TRK_VID_PROCESSOR.add_inputs_to_inference_session(
+        inference_session=session,
+        frame_idx=ref_frame_idx,
+        obj_ids=list(range(len(masks))),
+        input_masks=masks,
+    )
+
+    def frame_detections(model_out):
+        pp_masks = TRK_VID_PROCESSOR.post_process_masks(
+            [model_out.pred_masks],
+            original_sizes=[[session.video_height, session.video_width]],
+            binarize=False,
+        )[0]  # (num_objects, 1, H, W)
+        dets = []
+        for i, obj_id in enumerate(session.obj_ids):
+            mask_bin = (pp_masks[i, 0].cpu().numpy() > 0.0).astype(np.uint8)
+            xyxy = mask_to_xyxy(mask_bin)
+            if not xyxy:
+                continue
+            x0, y0, x1, y1 = xyxy
+            det = {
+                "frame": model_out.frame_idx,
+                "track_id": int(obj_id),
+                "x": x0 / vid_w,
+                "y": y0 / vid_h,
+                "w": (x1 - x0) / vid_w,
+                "h": (y1 - y0) / vid_h,
+                "conf": 1,
+            }
+            if not drop_masks:
+                det["mask_b64"] = b64_mask_encode(mask_bin).decode("ascii")
+            dets.append(det)
+        return dets
+
+    detections = []
+    for model_out in TRK_VID_MODEL.propagate_in_video_iterator(
+        inference_session=session,
+        start_frame_idx=ref_frame_idx,
+        max_frame_num_to_track=len(video_frames),
+    ):
+        detections.extend(frame_detections(model_out))
+    if ref_frame_idx > 0:
+        # backward pass ref..0; the ref frame itself is already covered by the forward pass
+        for model_out in TRK_VID_MODEL.propagate_in_video_iterator(
+            inference_session=session, start_frame_idx=ref_frame_idx, reverse=True
+        ):
+            if model_out.frame_idx == ref_frame_idx:
+                continue
+            detections.extend(frame_detections(model_out))
+    detections.sort(key=lambda d: (d["frame"], d["track_id"]))
+    return detections
 
 
 def image_visual_inference(
@@ -583,6 +752,59 @@ with gr.Blocks() as app:
             title="SAM3 Video Segmentation",
             description="Segment Objects in Video using Text Prompts",
             api_name="video_annotation",
+        )
+    with gr.Tab("Video Visual Tracking"):
+        gr.Interface(
+            fn=video_visual_inference,
+            inputs=[
+                gr.Video(label="Input Video"),
+                gr.Textbox(
+                    label="Masks for Objects of Interest in the Reference Frame",
+                    value=None,
+                    lines=5,
+                    placeholder="""
+                    JSON list of base64 encoded masks, e.g.: ["b'iVBORw0KGgoAAAANSUhEUgAABDgAAAeAAQAAAAADGtqnAAAXz...'",...]
+                    """,
+                ),
+                gr.Checkbox(
+                    label="Drop Masks",
+                    info="remove base64 encoded masks from result JSON",
+                    value=True,
+                ),
+                gr.Number(
+                    label="Reference Frame Index",
+                    info="frame index for the provided object masks",
+                    value=0,
+                    precision=0,
+                ),
+                gr.Number(
+                    label="Timeout Override (seconds)",
+                    info="max GPU lease; leave empty to auto-estimate from video length and downsampling",
+                    value=None,
+                    precision=0,
+                ),
+                gr.Number(
+                    label="Sample FPS",
+                    info="downsample the video to this many frames per second before tracking; empty = every frame",
+                    value=None,
+                ),
+                gr.Number(
+                    label="Every Xth Frame",
+                    info="keep only every Nth frame before tracking; ignored when Sample FPS is set",
+                    value=None,
+                    precision=0,
+                ),
+                gr.Dropdown(
+                    label="Video Load Device",
+                    info="where preprocessed frames are stored; cpu streams them to the GPU per frame",
+                    choices=["cpu", "cuda"],
+                    value="cpu",
+                ),
+            ],
+            outputs=gr.JSON(label="Output JSON"),
+            title="SAM3 Video Tracking (Visual Prompts)",
+            description="Track Objects in Video from their Masks on a Reference Frame (SAM2-style)",
+            api_name="video_visual_inference",
         )
     with gr.Tab("Image Visual Segmentation"):
         gr.Interface(
