@@ -60,6 +60,12 @@ try:
     IMG_MODEL = Sam3Model.from_pretrained("facebook/sam3").to(DEVICE)
     IMG_PROCESSOR = Sam3Processor.from_pretrained("facebook/sam3")
     # Visual-prompt image segmentation (points/boxes, SAM2-style)
+    # transformers bug (present through v5.6/main): Sam3TrackerModel declares
+    # `_base_model_prefix` (a dead attribute) instead of `base_model_prefix`, so the
+    # facebook/sam3 checkpoint's `tracker_model.` key prefix is never stripped and the
+    # prompt encoder + mask decoder silently stay randomly initialized (garbage masks).
+    # The video classes (Sam3TrackerVideoPreTrainedModel) spell it correctly and load fine.
+    Sam3TrackerModel.base_model_prefix = "tracker_model"
     TRK_MODEL = Sam3TrackerModel.from_pretrained("facebook/sam3").to(DEVICE)
     TRK_PROCESSOR = Sam3TrackerProcessor.from_pretrained("facebook/sam3")
     logger.success("Image Models and Processors Loaded!")
@@ -185,7 +191,9 @@ def calc_effective_fps(vid_fps: float, sample_fps: float = None, every_x: int = 
 GPU_DURATION_PER_FRAME_S = 0.5
 GPU_DURATION_OVERHEAD_S = 20  # ffmpeg extraction + session preprocessing
 GPU_DURATION_MIN_S = 30
-GPU_DURATION_MAX_S = 300  # videos estimated above this should be downsampled instead
+GPU_DURATION_MAX_S = (
+    600  # 5-minutes: videos estimated above this should be downsampled instead
+)
 GPU_DURATION_FALLBACK_S = 120  # metadata probe failed
 
 
@@ -433,9 +441,9 @@ def video_visual_inference(
         every_x: Keep only every Nth frame of the video before tracking, e.g. 5 keeps original frames 0, 5, 10, ... (ignored when sample_fps is set); leave empty to keep every frame.
         video_load_device: Device the video frames are preprocessed and stored on: "cpu" (default) streams frames to the GPU one at a time and keeps GPU memory low; "cuda" holds the whole preprocessed video in GPU memory, which is faster per frame but runs out of GPU memory on long videos.
     """
-    assert TRK_VID_MODEL is not None and TRK_VID_PROCESSOR is not None, (
-        "Tracker video model failed to load on startup."
-    )
+    assert (
+        TRK_VID_MODEL is not None and TRK_VID_PROCESSOR is not None
+    ), "Tracker video model failed to load on startup."
     assert input_video and masks, "Missing video or masks."
     video_path = (
         input_video if isinstance(input_video, str) else input_video.get("name", None)
@@ -495,7 +503,9 @@ def video_visual_inference(
             [model_out.pred_masks],
             original_sizes=[[session.video_height, session.video_width]],
             binarize=False,
-        )[0]  # (num_objects, 1, H, W)
+        )[
+            0
+        ]  # (num_objects, 1, H, W)
         dets = []
         for i, obj_id in enumerate(session.obj_ids):
             # .float(): numpy can't convert bfloat16 (binarize=False keeps session dtype)
@@ -555,9 +565,9 @@ def image_visual_inference(
         points: Point prompts as a list of dicts (or a JSON string), each dict {"x","y"} in absolute pixels; all points together define a single object/mask.
         point_labels: List of ints (or a JSON string) parallel to points, 1=foreground and 0=background; required whenever points is given.
     """
-    assert TRK_MODEL is not None and TRK_PROCESSOR is not None, (
-        "Image tracker model failed to load on startup."
-    )
+    assert (
+        TRK_MODEL is not None and TRK_PROCESSOR is not None
+    ), "Image tracker model failed to load on startup."
 
     # input validation (mirrors SAM2 process_image)
     has_bboxes = bboxes is not None and bboxes != ""
@@ -575,9 +585,9 @@ def image_visual_inference(
         else point_labels
     )
     if has_points:
-        assert len(points) == len(point_labels), (
-            f"{len(points)} points provided but there are {len(point_labels)} labels."
-        )
+        assert len(points) == len(
+            point_labels
+        ), f"{len(points)} points provided but there are {len(point_labels)} labels."
 
     # Build transformers prompt inputs (same nesting as SAM2):
     #   input_boxes:  (image, num_boxes, 4)            -> one object per box
@@ -624,9 +634,9 @@ def image_text_inference(
         prompt: Natural-language concept to segment, e.g. "player in white"; all matching instances are returned.
         conf_threshold: Minimum detection score from 0.0 to 1.0; instances scoring below this are discarded.
     """
-    assert IMG_MODEL is not None and IMG_PROCESSOR is not None, (
-        "Image text model failed to load on startup."
-    )
+    assert (
+        IMG_MODEL is not None and IMG_PROCESSOR is not None
+    ), "Image text model failed to load on startup."
     assert im is not None and prompt, "Missing image or prompt."
 
     pil_image = im.convert("RGB")
@@ -637,9 +647,9 @@ def image_text_inference(
 def _gpu_image_text_inference(
     pil_image: Image.Image, prompt: str, conf_threshold: float
 ) -> list[dict]:
-    inputs = IMG_PROCESSOR(
-        images=pil_image, text=prompt, return_tensors="pt"
-    ).to(DEVICE)
+    inputs = IMG_PROCESSOR(images=pil_image, text=prompt, return_tensors="pt").to(
+        DEVICE
+    )
     with torch.no_grad():
         outputs = IMG_MODEL(**inputs)
 
@@ -850,9 +860,7 @@ with gr.Blocks() as app:
                     info="Concept to segment, e.g. 'player in white'",
                     value="",
                 ),
-                gr.Slider(
-                    0.0, 1.0, value=0.5, step=0.05, label="Confidence Threshold"
-                ),
+                gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="Confidence Threshold"),
             ],
             outputs=gr.JSON(label="Output JSON"),
             title="SAM3 Image Segmentation (Text Prompt)",
