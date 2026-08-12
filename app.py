@@ -498,7 +498,8 @@ def video_visual_inference(
         )[0]  # (num_objects, 1, H, W)
         dets = []
         for i, obj_id in enumerate(session.obj_ids):
-            mask_bin = (pp_masks[i, 0].cpu().numpy() > 0.0).astype(np.uint8)
+            # .float(): numpy can't convert bfloat16 (binarize=False keeps session dtype)
+            mask_bin = (pp_masks[i, 0].cpu().float().numpy() > 0.0).astype(np.uint8)
             xyxy = mask_to_xyxy(mask_bin)
             if not xyxy:
                 continue
